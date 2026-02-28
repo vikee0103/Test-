@@ -3,7 +3,7 @@ import re
 from typing import Dict
 
 import streamlit as st
-import pdfplumber
+import pypdf  # Changed from pdfplumber to pypdf
 from docx import Document
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -11,21 +11,30 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ═══════════════════════════════════════════════════════
-# PDF EXTRACTION
+# PDF PARSING — Using pypdf (PyPDF2 successor)
 # ═══════════════════════════════════════════════════════
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract all text from PDF pages and return as single normalized string."""
-    text_parts = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            raw = page.extract_text()
-            if raw:
-                text_parts.append(raw)
-    return "\n".join(text_parts)
+    """
+    Extract all text from PDF using pypdf.
+    pypdf produces cleaner text output than pdfplumber for this use case.
+    """
+    text = ""
+    pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    
+    for page in pdf_reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+    
+    return text
 
 
 def parse_issue_briefing_pdf(text: str) -> Dict[str, str]:
+    """
+    Extract issue fields from PDF text using regex patterns.
+    This approach works reliably with pypdf's text extraction.
+    """
     fields = {
         "Title": "",
         "Issue ID": "",
@@ -34,58 +43,48 @@ def parse_issue_briefing_pdf(text: str) -> Dict[str, str]:
         "Issue Root Cause": "",
     }
 
-    # STEP 1: Strip floating label words that appear as standalone lines
-    # mid-paragraph (caused by vertically centered cell labels in PDF tables).
-    # Only removes them when they appear ALONE on a line — never mid-sentence.
-    floating_labels = [
-        "Description",
-        "Issue Impact",
-        "Issue Root Cause",
-        "Issue Details",
-    ]
-    cleaned = text
-    for label in floating_labels:
-        cleaned = re.sub(
-            r'\n\s*' + re.escape(label) + r'\s*\n',
-            '\n',
-            cleaned
-        )
+    # Extract Issue ID (Format: ISSUE-00077693)
+    issue_id_match = re.search(r'ISSUE-\d+', text, re.IGNORECASE)
+    if issue_id_match:
+        fields["Issue ID"] = issue_id_match.group(0).strip()
 
-    # STEP 2: Normalize entire text to a single line
-    normalized = " ".join(cleaned.split())
 
-    # Title: between "Title" and "Issue ID"
-    m = re.search(r"\bTitle\s+(.+?)\s+Issue\s+ID\b", normalized)
-    if m:
-        fields["Title"] = m.group(1).strip()
+    title_match = re.search(r'Title\s+(.+?)\s+Issue\s*ID', text, re.IGNORECASE)
+    if title_match:
+        fields["Title"] = title_match.group(1).strip()
 
-    # Issue ID: ISSUE-XXXXXX pattern directly after "Issue ID"
-    m = re.search(r"\bIssue\s+ID\s+(ISSUE-\S+)", normalized)
-    if m:
-        fields["Issue ID"] = m.group(1).strip()
+    # Extract Description (Between "Description" and "Issue Impact")
+    desc_match = re.search(
+        r'Description\s*\n\s*(.+?)(?=\s*Issue Impact)',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if desc_match:
+        fields["Description"] = desc_match.group(1).strip()
 
-    # Description: after Issue ID value up to "Issue Impact"
-    # "Description" label has been removed in Step 1, so text flows naturally
-    m = re.search(r"ISSUE-\S+\s+(.+?)\s+Issue\s+Impact\b", normalized)
-    if m:
-        fields["Description"] = m.group(1).strip()
+    # Extract Issue Impact (Between "Issue Impact" and "Issue Root Cause")
+    impact_match = re.search(
+        r'Issue Impact\s*\n\s*(.+?)(?=\s*Issue Root Cause)',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if impact_match:
+        fields["Issue Impact"] = impact_match.group(1).strip()
 
-    # Issue Impact: between "Issue Impact" and "Issue Root Cause"
-    m = re.search(r"\bIssue\s+Impact\s+(.+?)\s+Issue\s+Root\s+Cause\b", normalized)
-    if m:
-        fields["Issue Impact"] = m.group(1).strip()
-
-    # Issue Root Cause: between "Issue Root Cause" and "Overall Issue Rating"
-    m = re.search(r"\bIssue\s+Root\s+Cause\s+(.+?)\s+Overall\s+Issue\s+Rating\b", normalized)
-    if m:
-        fields["Issue Root Cause"] = m.group(1).strip()
+    # Extract Issue Root Cause (Between "Issue Root Cause" and "Overall Issue Rating")
+    root_cause_match = re.search(
+        r'Issue Root Cause\s*\n\s*(.+?)(?=\s*Overall Issue Rating)',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if root_cause_match:
+        fields["Issue Root Cause"] = root_cause_match.group(1).strip()
 
     return fields
 
 
-
 # ═══════════════════════════════════════════════════════
-# DOCX EXTRACTION (ALREADY WORKING — UNCHANGED)
+# DOCX PARSING (UNCHANGED, WORKING)
 # ═══════════════════════════════════════════════════════
 
 def parse_icp_docx_from_file(file_bytes: bytes) -> Dict[str, str]:
@@ -188,26 +187,24 @@ def main():
     threshold = st.slider("Match threshold", 0.0, 1.0, 0.8, 0.05)
 
     if pdf_file and docx_file and st.button("🔍 Compare"):
-
         pdf_bytes = pdf_file.read()
         docx_bytes = docx_file.read()
 
-        # Parse
+        # Parse using pypdf approach
         pdf_text = extract_text_from_pdf(pdf_bytes)
         f1 = parse_issue_briefing_pdf(pdf_text)
         f2 = parse_icp_docx_from_file(docx_bytes)
 
-        # Debug
         with st.expander("🔍 Raw PDF text (first 3000 chars)"):
             st.text(pdf_text[:3000])
-
+        
         with st.expander("🔍 Parsed fields — IBF (PDF)"):
             st.json(f1)
 
         with st.expander("🔍 Parsed fields — ICP (DOCX)"):
             st.json(f2)
 
-        # Key fields table
+        # Key fields comparison
         st.subheader("📋 Key Fields Comparison")
         df_kv = pd.DataFrame([
             {"Attribute": "Title",            "IBF (PDF)": f1.get("Title", ""),            "ICP (DOCX)": f2.get("Title", "")},
@@ -223,7 +220,7 @@ def main():
             "ibf_icp_key_fields.csv", "text/csv"
         )
 
-        # Similarity table
+        # Similarity scores
         st.subheader("📊 Similarity Scores")
         scores = compute_similarity(f1, f2)
         sim_rows = []
