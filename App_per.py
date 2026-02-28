@@ -1,6 +1,6 @@
 import io
 import re
-from typing import Dict
+from typing import Dict, List
 
 import streamlit as st
 import pdfplumber
@@ -10,35 +10,69 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-# ---------- TEXT EXTRACTION HELPERS ----------
+# ═══════════════════════════════════════════════════════
+# PDF EXTRACTION — POSITIONAL WORD GROUPING
+# ═══════════════════════════════════════════════════════
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    text = []
+def get_words_with_position(page) -> List[dict]:
+    """Return all words with x0, y0, x1, y1 from pdfplumber page."""
+    return page.extract_words(
+        x_tolerance=3,
+        y_tolerance=3,
+        keep_blank_chars=False,
+        use_text_flow=False,
+    )
+
+
+def group_words_into_lines(words: List[dict], y_tolerance: int = 5) -> List[str]:
+    """
+    Group words that share approximately the same y0 (same row)
+    and sort them left-to-right. Returns list of line strings.
+    """
+    if not words:
+        return []
+    
+    # Sort by top (y0) then left (x0)
+    words_sorted = sorted(words, key=lambda w: (round(float(w["top"]) / y_tolerance), float(w["x0"])))
+    
+    lines = []
+    current_line_words = [words_sorted[0]]
+    current_top = round(float(words_sorted[0]["top"]) / y_tolerance)
+    
+    for word in words_sorted[1:]:
+        word_top = round(float(word["top"]) / y_tolerance)
+        if word_top == current_top:
+            current_line_words.append(word)
+        else:
+            lines.append(" ".join(w["text"] for w in current_line_words))
+            current_line_words = [word]
+            current_top = word_top
+    
+    lines.append(" ".join(w["text"] for w in current_line_words))
+    return lines
+
+
+def extract_pdf_as_lines(file_bytes: bytes) -> List[str]:
+    """
+    Extract full PDF as positionally-sorted lines.
+    Each line contains words that appear on same y-coordinate,
+    ordered left to right — so table row content is on ONE line.
+    """
+    all_lines = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text.append(page.extract_text() or "")
-    return "\n".join(text)
+            words = get_words_with_position(page)
+            lines = group_words_into_lines(words, y_tolerance=5)
+            all_lines.extend(lines)
+    return all_lines
 
 
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    file_stream = io.BytesIO(file_bytes)
-    doc = Document(file_stream)
-    text = []
-    for para in doc.paragraphs:
-        text.append(para.text)
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text for cell in row.cells]
-            text.append(" | ".join(cells))
-    return "\n".join(text)
-
-
-# ---------- FIELD PARSING FROM RAW TEXT ----------
-
-def parse_issue_briefing_pdf_from_file(file_bytes: bytes) -> Dict[str, str]:
+def parse_pdf_lines(lines: List[str]) -> Dict[str, str]:
     """
-    Parse IBF PDF by extracting tables cell-by-cell using pdfplumber,
-    matching the actual table layout of the document.
+    Parse key fields from positionally-reconstructed lines.
+    Since words on the same row are now on the same line, patterns like:
+      'Title Investment Banking Supervisory Structure Gaps Issue ID ISSUE-00077693'
+    are reliably parseable.
     """
     fields = {
         "Title": "",
@@ -48,55 +82,56 @@ def parse_issue_briefing_pdf_from_file(file_bytes: bytes) -> Dict[str, str]:
         "Issue Root Cause": "",
     }
 
-    kv_map = {}
-    paragraph_text_parts = []
+    full_text = "\n".join(lines)
 
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            # ---- Extract tables: walk rows and pair cells as key→value ----
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    # Clean cells: strip whitespace, replace None
-                    cells = [
-                        (c.strip().replace("\n", " ") if c else "")
-                        for c in row
-                    ]
-                    # Walk cells in pairs
-                    i = 0
-                    while i < len(cells) - 1:
-                        key = cells[i].rstrip(":").strip()
-                        value = cells[i + 1].strip()
-                        if key:
-                            kv_map[key] = value
-                        i += 2
+    # ---- Title ----
+    # Line looks like: "Title Investment Banking Supervisory Structure Gaps Issue ID ISSUE-00077693"
+    # OR: "Title Investment Banking Supervisory Structure Gaps"
+    title_match = re.search(
+        r"\bTitle\b\s+(.+?)\s+Issue\s+ID\b",
+        full_text,
+        flags=re.DOTALL,
+    )
+    if title_match:
+        fields["Title"] = " ".join(title_match.group(1).split())
+    else:
+        # fallback: Title spans to end of line
+        for line in lines:
+            if re.match(r"^Title\s+\S", line):
+                fields["Title"] = re.sub(r"^Title\s+", "", line).strip()
+                break
 
-            # ---- Also collect plain text for paragraph-style fields ----
-            raw = page.extract_text()
-            if raw:
-                paragraph_text_parts.append(raw)
+    # ---- Issue ID ----
+    issue_id_match = re.search(
+        r"\bIssue\s+ID\s+(ISSUE-\S+)",
+        full_text,
+    )
+    if issue_id_match:
+        fields["Issue ID"] = issue_id_match.group(1).strip()
 
-    # ---- Map key-value pairs ----
-    fields["Title"] = kv_map.get("Title", "")
-    fields["Issue ID"] = kv_map.get("Issue ID", kv_map.get("Issue\nID", ""))
-
-    # ---- Paragraph fields from plain text ----
-    combined = "\n".join(paragraph_text_parts)
-
+    # ---- Description ----
     desc_match = re.search(
-        r"Description\s+(.+?)Issue Impact", combined, flags=re.DOTALL
+        r"Description\s+(.+?)Issue Impact",
+        full_text,
+        flags=re.DOTALL,
     )
     if desc_match:
         fields["Description"] = " ".join(desc_match.group(1).split())
 
+    # ---- Issue Impact ----
     impact_match = re.search(
-        r"Issue Impact\s+(.+?)Issue Root Cause", combined, flags=re.DOTALL
+        r"Issue Impact\s+(.+?)Issue Root Cause",
+        full_text,
+        flags=re.DOTALL,
     )
     if impact_match:
         fields["Issue Impact"] = " ".join(impact_match.group(1).split())
 
+    # ---- Issue Root Cause ----
     root_match = re.search(
-        r"Issue Root Cause\s+(.+?)Overall Issue Rating", combined, flags=re.DOTALL
+        r"Issue Root Cause\s+(.+?)Overall Issue Rating",
+        full_text,
+        flags=re.DOTALL,
     )
     if root_match:
         fields["Issue Root Cause"] = " ".join(root_match.group(1).split())
@@ -104,12 +139,11 @@ def parse_issue_briefing_pdf_from_file(file_bytes: bytes) -> Dict[str, str]:
     return fields
 
 
+# ═══════════════════════════════════════════════════════
+# DOCX EXTRACTION — TABLE CELL WALK (WORKING)
+# ═══════════════════════════════════════════════════════
 
 def parse_icp_docx_from_file(file_bytes: bytes) -> Dict[str, str]:
-    """
-    Parse ICP DOCX by walking tables cell-by-cell.
-    This correctly handles fields in separate table cells.
-    """
     fields = {
         "Title": "",
         "Issue ID": "",
@@ -119,39 +153,32 @@ def parse_icp_docx_from_file(file_bytes: bytes) -> Dict[str, str]:
     }
 
     doc = Document(io.BytesIO(file_bytes))
-
-    # ---- Step 1: Extract all table cells as a flat key→value map ----
-    # Many tables are key-value pairs side by side in the same row.
-    # e.g. | Issue Title: | Investment Banking... | Source System Issue Reference: | ISSUE-00077693 |
     kv_map = {}
+
+    # Walk table cells row by row
     for table in doc.tables:
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            # Walk cells in pairs (label, value, label, value ...)
+            cells = [" ".join(cell.text.split()) for cell in row.cells]
             i = 0
             while i < len(cells) - 1:
-                key = cells[i].rstrip(":")
-                value = cells[i + 1]
-                if key and value:
-                    kv_map[key.strip()] = value.strip()
+                key = cells[i].rstrip(":").strip()
+                value = cells[i + 1].strip()
+                if key:
+                    kv_map[key] = value
                 i += 2
 
-    # ---- Step 2: Map known keys to fields ----
-    fields["Title"] = kv_map.get("Issue Title", "")
-    fields["Issue ID"] = kv_map.get("Source System Issue Reference", "")
+    # Normalize keys
+    normalized_kv = {" ".join(k.split()).lower(): v for k, v in kv_map.items()}
 
-    # ---- Step 3: For paragraph-style fields, scan paragraphs ----
-    # These are in merged single-cell rows (long text blocks)
-    full_text = "\n".join([p.text for p in doc.paragraphs])
+    fields["Title"] = normalized_kv.get("issue title", "")
+    fields["Issue ID"] = normalized_kv.get("source system issue reference", "")
 
-    # Also collect all table cell text for paragraph blocks
-    table_text_parts = []
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                table_text_parts.append(cell.text)
-    table_text = "\n".join(table_text_parts)
-    combined = full_text + "\n" + table_text
+    # Paragraph-style fields from paragraphs + table cells
+    para_text = "\n".join(p.text for p in doc.paragraphs)
+    table_text = "\n".join(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+    combined = para_text + "\n" + table_text
 
     desc_match = re.search(
         r"Issue Description:\s*(.+?)Issue Root Cause:", combined, flags=re.DOTALL
@@ -180,173 +207,110 @@ def parse_icp_docx_from_file(file_bytes: bytes) -> Dict[str, str]:
     return fields
 
 
-
-# ---------- SIMILARITY COMPUTATION ----------
+# ═══════════════════════════════════════════════════════
+# SIMILARITY COMPUTATION
+# ═══════════════════════════════════════════════════════
 
 def text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     vectorizer = TfidfVectorizer().fit([a, b])
     tfidf = vectorizer.transform([a, b])
-    sim = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
-    return float(sim)
+    return float(cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0])
 
 
 def compute_similarity(f1: Dict[str, str], f2: Dict[str, str]) -> Dict[str, float]:
     scores = {}
     scores["Issue ID"] = 1.0 if f1.get("Issue ID") == f2.get("Issue ID") else 0.0
     scores["Title"] = text_similarity(f1.get("Title", ""), f2.get("Title", ""))
-    scores["Description"] = text_similarity(
-        f1.get("Description", ""), f2.get("Description", "")
-    )
-    scores["Issue Root Cause"] = text_similarity(
-        f1.get("Issue Root Cause", ""), f2.get("Issue Root Cause", "")
-    )
-    scores["Issue Impact"] = text_similarity(
-        f1.get("Issue Impact", ""), f2.get("Issue Impact", "")
-    )
+    scores["Description"] = text_similarity(f1.get("Description", ""), f2.get("Description", ""))
+    scores["Issue Root Cause"] = text_similarity(f1.get("Issue Root Cause", ""), f2.get("Issue Root Cause", ""))
+    scores["Issue Impact"] = text_similarity(f1.get("Issue Impact", ""), f2.get("Issue Impact", ""))
     scores["Overall"] = sum(scores.values()) / len(scores)
     return scores
 
 
-def to_match_label(score: float, threshold: float) -> str:
-    return "Match" if score >= threshold else "Mismatch"
+def match_label(score: float, threshold: float) -> str:
+    return "✅ Match" if score >= threshold else "❌ Mismatch"
 
 
-# ---------- STREAMLIT APP ----------
+# ═══════════════════════════════════════════════════════
+# STREAMLIT UI
+# ═══════════════════════════════════════════════════════
 
 def main():
-    st.title("IBF vs ICP Comparison")
-
-    st.write(
-        "Upload the Issue Briefing Form (PDF) and Issue Closure Pack ICP (DOCX) "
-        "to view key fields, similarity scores, and match/mismatch flags."
-    )
+    st.set_page_config(page_title="IBF vs ICP Comparison", layout="wide")
+    st.title("📄 IBF vs ICP Comparison")
+    st.write("Upload the Issue Briefing Form (PDF) and Issue Closure Pack (DOCX) to compare key fields.")
 
     col1, col2 = st.columns(2)
     with col1:
-        pdf_file = st.file_uploader(
-            "Upload Issue Briefing Form (PDF)",
-            type=["pdf"],
-            key="pdf",
-        )
+        pdf_file = st.file_uploader("Upload Issue Briefing Form (PDF)", type=["pdf"])
     with col2:
-        docx_file = st.file_uploader(
-            "Upload Issue Closure Pack ICP (DOCX)",
-            type=["docx"],
-            key="docx",
-        )
+        docx_file = st.file_uploader("Upload Issue Closure Pack ICP (DOCX)", type=["docx"])
 
-    threshold = st.slider(
-        "Match threshold (for similarity scores)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.8,
-        step=0.05,
-    )
+    threshold = st.slider("Match threshold", 0.0, 1.0, 0.8, 0.05)
 
-    if pdf_file and docx_file and st.button("Compare"):
+    if pdf_file and docx_file and st.button("🔍 Compare"):
+
         pdf_bytes = pdf_file.read()
         docx_bytes = docx_file.read()
 
-        pdf_text = extract_text_from_pdf(pdf_bytes)
-        docx_text = extract_text_from_docx(docx_bytes)
+        # --- Parse PDF using positional word grouping ---
+        pdf_lines = extract_pdf_as_lines(pdf_bytes)
+        f1 = parse_pdf_lines(pdf_lines)
 
-        # Optional: debug view
-        with st.expander("Raw PDF text (first 2000 chars)"):
-            st.text(pdf_text[:2000])
-
-        with st.expander("Raw DOCX text (first 2000 chars)"):
-            st.text(docx_text[:2000])
-
-        # Parse structured fields
-        f1 = parse_issue_briefing_pdf_from_file(pdf_bytes)
+        # --- Parse DOCX using table cell walk ---
         f2 = parse_icp_docx_from_file(docx_bytes)
 
-        st.subheader("Parsed fields from IBF (PDF)")
-        st.json(f1)
+        # --- DEBUG expanders ---
+        with st.expander("🔍 PDF reconstructed lines (debug)"):
+            for i, line in enumerate(pdf_lines[:40]):
+                st.text(f"[{i}] {line}")
 
-        st.subheader("Parsed fields from ICP (DOCX)")
-        st.json(f2)
+        with st.expander("🔍 Parsed fields from IBF (PDF)"):
+            st.json(f1)
 
-        # ---------- Key-value table ----------
+        with st.expander("🔍 Parsed fields from ICP (DOCX)"):
+            st.json(f2)
+
+        # --- Key-value comparison table ---
+        st.subheader("📋 Key Fields Comparison")
         rows_kv = [
-            {
-                "Attribute": "Title",
-                "IBF (PDF)": f1.get("Title", ""),
-                "ICP (DOCX)": f2.get("Title", ""),
-            },
-            {
-                "Attribute": "Issue ID",
-                "IBF (PDF)": f1.get("Issue ID", ""),
-                "ICP (DOCX)": f2.get("Issue ID", ""),
-            },
-            {
-                "Attribute": "Description",
-                "IBF (PDF)": f1.get("Description", ""),
-                "ICP (DOCX)": f2.get("Description", ""),
-            },
-            {
-                "Attribute": "Issue Root Cause",
-                "IBF (PDF)": f1.get("Issue Root Cause", ""),
-                "ICP (DOCX)": f2.get("Issue Root Cause", ""),
-            },
-            {
-                "Attribute": "Issue Impact",
-                "IBF (PDF)": f1.get("Issue Impact", ""),
-                "ICP (DOCX)": f2.get("Issue Impact", ""),
-            },
+            {"Attribute": "Title",            "IBF (PDF)": f1.get("Title", ""),            "ICP (DOCX)": f2.get("Title", "")},
+            {"Attribute": "Issue ID",         "IBF (PDF)": f1.get("Issue ID", ""),         "ICP (DOCX)": f2.get("Issue ID", "")},
+            {"Attribute": "Description",      "IBF (PDF)": f1.get("Description", ""),      "ICP (DOCX)": f2.get("Description", "")},
+            {"Attribute": "Issue Root Cause", "IBF (PDF)": f1.get("Issue Root Cause", ""), "ICP (DOCX)": f2.get("Issue Root Cause", "")},
+            {"Attribute": "Issue Impact",     "IBF (PDF)": f1.get("Issue Impact", ""),     "ICP (DOCX)": f2.get("Issue Impact", "")},
         ]
         df_kv = pd.DataFrame(rows_kv)
+        st.dataframe(df_kv, use_container_width=True)
 
-        st.subheader("Key fields from IBF and ICP")
-        st.table(df_kv)
-
-        # CSV download for key-value table
         csv_kv = df_kv.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download key fields as CSV",
-            data=csv_kv,
-            file_name="ibf_icp_key_fields.csv",
-            mime="text/csv",
-        )
+        st.download_button("⬇️ Download key fields CSV", csv_kv, "ibf_icp_key_fields.csv", "text/csv")
 
-        # ---------- Similarity scores ----------
+        # --- Similarity scores table ---
+        st.subheader("📊 Similarity Scores")
         scores = compute_similarity(f1, f2)
-
         sim_rows = []
         for field in ["Issue ID", "Title", "Description", "Issue Root Cause", "Issue Impact"]:
             score = scores[field]
-            label = to_match_label(
-                score,
-                threshold if field != "Issue ID" else 1.0,
-            )
-            sim_rows.append(
-                {
-                    "Field": field,
-                    "Similarity Score": round(score, 3),
-                    "Result": label,
-                }
-            )
-        sim_rows.append(
-            {
-                "Field": "Overall",
-                "Similarity Score": round(scores["Overall"], 3),
-                "Result": to_match_label(scores["Overall"], threshold),
-            }
-        )
+            thresh = 1.0 if field == "Issue ID" else threshold
+            sim_rows.append({
+                "Field": field,
+                "Similarity Score": round(score, 3),
+                "Result": match_label(score, thresh),
+            })
+        sim_rows.append({
+            "Field": "Overall",
+            "Similarity Score": round(scores["Overall"], 3),
+            "Result": match_label(scores["Overall"], threshold),
+        })
         df_sim = pd.DataFrame(sim_rows)
-
-        st.subheader("Similarity results")
-        st.table(df_sim)
+        st.dataframe(df_sim, use_container_width=True)
 
         csv_sim = df_sim.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download similarity scores as CSV",
-            data=csv_sim,
-            file_name="ibf_icp_similarity_scores.csv",
-            mime="text/csv",
-        )
+        st.download_button("⬇️ Download similarity scores CSV", csv_sim, "ibf_icp_similarity_scores.csv", "text/csv")
 
 
 if __name__ == "__main__":
